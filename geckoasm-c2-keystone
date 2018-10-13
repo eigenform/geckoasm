@@ -1,0 +1,78 @@
+#!/usr/bin/python
+""" geckoasm-c2-keystone
+Use Keystone instead of GNU as. Seems to work okay, apart from the fact that 
+we need to do a bunch of transformations on perfectly sane assembly in order
+to get Keystone to parse things correctly. Kinda sucks.
+"""
+
+from sys import argv
+from keystone import *
+from binascii import hexlify
+
+if (len(argv) < 2):
+    print("usage: geckoasm-c2-keystone <input file>")
+
+def fix_regs(data):
+    """ We have to parse up assembly somewhat in order to get Keystone
+    to play nicely, which sucks. This will probably break things. """
+    res = data
+    for reg in range(0, 31):
+        # Replace "rN" with "N"
+        res = res.replace("r"+str(reg), str(reg))
+        res = res.replace("(r"+str(reg)+")", "("+str(reg)+")")
+        res = res.replace(" r"+str(reg), " "+str(reg))
+        res = res.replace("\tr"+str(reg), "\t"+str(reg))
+        res = res.replace(",r"+str(reg), ","+str(reg))
+
+        # Replace "fN" with "N"
+        res = res.replace(" f"+str(reg), " "+str(reg))
+        res = res.replace("\tf"+str(reg), "\t"+str(reg))
+
+    res = res.replace("sp", "1")
+    return res
+
+def get_target_branch(filename):
+    res = None
+    with open(filename, "r") as f:
+        for line in f:
+            # For the actual codehandler command
+            if ("#To be injected @" in line):
+                s = line.split(" ")
+                res = int(s[4], 16)
+    return res
+
+def read_file(filename):
+    with open(filename, "r") as f:
+        code = f.read()
+    return code
+
+
+
+# Pull stuff out of the file, and then prepare it for Keystone
+branch_targ = get_target_branch(argv[1])
+asm = read_file(argv[1])
+asm = fix_regs(asm)
+
+# Emit some bytecode
+ks = Ks(KS_ARCH_PPC, KS_MODE_PPC32 + KS_MODE_BIG_ENDIAN)
+encoding, count = ks.asm(asm)
+data = bytearray()
+for i in encoding:
+    data.append(i)
+
+# Transform bytecode into hex representation
+data = hexlify(data)
+instrs = [data[i:i+8] for i in range(0, len(data), 8)]
+if ((len(instrs) % 2) == 0):
+    instrs += [b"60000000", b"00000000"]
+else:
+    instrs.append(b"00000000")
+
+# Build the codehandler command and length
+command = hexlify((0xC2000000 | (branch_targ & 0x00ffffff)).to_bytes(4, byteorder='big'))
+num_lines = hexlify((len(instrs) // 2).to_bytes(4, byteorder='big'))
+output = [command, num_lines] + instrs
+
+# Output
+for i in range(0, len(output), 2):
+    print((output[i] + b" " + output[i+1]).decode('utf8').upper())
