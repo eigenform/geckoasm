@@ -1,0 +1,112 @@
+#!/usr/bin/python
+""" geckoasm-c2
+Produce a set of C2XXXXXX Gecko codes from PPC assembly.
+"""
+
+import shutil
+import os
+
+from sys import argv
+from subprocess import Popen, PIPE
+from binascii import hexlify
+from struct import pack, unpack
+
+# Try to find GCC - die if we can't
+GCC_BIN = shutil.which("powerpc-eabi-gcc")
+if (GCC_BIN is not None):
+    #print("[*] Using gcc at: {}".format(GCC_BIN))
+    pass
+else:
+    print("[!] Couldn't find GCC in your PATH :^(")
+    exit(-1)
+
+# Cute trick to suppress entrypoint warnings
+LINKER_OPTS = "-Wl,--oformat=binary,--entry=0x00000000"
+GCC_ARGS = ["-mregnames", "-nostdlib", LINKER_OPTS,]
+
+# Deal with user arguments
+if (len(argv) < 3):
+    print("usage: geckoasm-c2 <input file> <branch addr> [target dol]")
+    exit(0)
+if (argv[1] is "--help"):
+    print("usage: geckoasm-c2 <input file> <branch addr> [target dol]")
+    exit(0)
+
+INFILE  = argv[1]
+BRANCH_ADDR = int(argv[2], 16)
+
+if (len(argv) == 4):
+    DOLFILE = argv[3]
+    READ_DOL = True
+else:
+    READ_DOL = None
+
+
+def search_dol(filename, addr):
+    """ Given some virtual address, return corresponding bytecode """
+    dol = { 'text': [], }
+    for i in range(0,7):
+        dol['text'].append( {'addr': None, 'size': None, 'off': None} )
+    with open(filename, "rb") as f:
+        for i in range(0,7):
+            dol['text'][i]['off']  = unpack(">L", f.read(4))[0]
+        f.seek(44, os.SEEK_CUR)
+        for i in range(0,7):
+            dol['text'][i]['addr'] = unpack(">L", f.read(4))[0]
+        f.seek(44, os.SEEK_CUR)
+        for i in range(0,7):
+            dol['text'][i]['size'] = unpack(">L", f.read(4))[0]
+        f.seek(0)
+        dol_data = f.read()
+    patched_instr = None
+    patched_instr_code = None
+    for region in dol['text']:
+        region_size = region['addr'] + region['size']
+        if ((addr > region['addr']) and (addr < region_size)):
+            region_offset = addr - region['addr']
+            dol_offset = region['off'] + region_offset
+            patched_instr = dol_data[dol_offset:dol_offset+4]
+            patched_instr_code = hexlify(patched_instr)
+            break
+    return patched_instr_code
+
+def do_compile(filename):
+    """ Use GCC to get an array of bytecode from some input file """
+    call_args = [GCC_BIN, filename] + GCC_ARGS
+    p = Popen(call_args, stdout=PIPE, stderr=PIPE)
+    gcc_err = p.stderr.read()
+    gcc_out = p.stdout.read()
+    p.communicate()
+    gcc_rc = p.returncode
+    if (gcc_rc != 0):
+        print("[*] GCC returned non-zero - stderr output follows:")
+        print(gcc_err.decode('utf8'))
+        exit(gcc_rc)
+    else:
+        with open("a.out", "rb") as f:
+            raw = f.read()
+            if (os.path.exists("a.out")):
+                os.remove("a.out")
+    return raw
+
+''' ---------------------------------------------------------------------------
+Actual main routine goes here
+'''
+
+text = hexlify(do_compile(INFILE))
+instrs = [text[i:i+8] for i in range(0, len(text), 8)]
+
+if (READ_DOL):
+    patched_instr_code = search_dol(DOLFILE, BRANCH_ADDR)
+    instrs = [patched_instr_code] + instrs
+
+if ((len(instrs) % 2) == 0):
+    instrs += [b"60000000", b"00000000"]
+else:
+    instrs.append(b"00000000")
+
+command = hexlify((0xC2000000 | (BRANCH_ADDR & 0x00ffffff)).to_bytes(4, byteorder='big'))
+num_lines = hexlify((len(instrs) // 2).to_bytes(4, byteorder='big'))
+output = [command, num_lines] + instrs
+for i in range(0, len(output), 2):
+    print((output[i] + b" " + output[i+1]).decode('utf8'))
