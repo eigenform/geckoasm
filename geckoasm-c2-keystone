@@ -28,7 +28,10 @@ def fix_regs(data):
         res = res.replace(" f"+str(reg), " "+str(reg))
         res = res.replace("\tf"+str(reg), "\t"+str(reg))
 
-    res = res.replace("sp", "1")
+    #res = res.replace("sp", "1")
+    res = res.replace("(sp)", "(1)")
+    res = res.replace(" sp", " 1")
+    res = res.replace("\tsp", "\t1")
     return res
 
 def get_target_branch(filename):
@@ -36,7 +39,7 @@ def get_target_branch(filename):
     with open(filename, "r") as f:
         for line in f:
             # For the actual codehandler command
-            if ("#To be injected @" in line):
+            if ( ("#To be injected @" in line) or ("#To be inserted at" in line)):
                 s = line.split(" ")
                 res = int(s[4], 16)
     return res
@@ -50,6 +53,11 @@ def read_file(filename):
 
 # Pull stuff out of the file, and then prepare it for Keystone
 branch_targ = get_target_branch(argv[1])
+if (branch_targ is None):
+    print("[!] Couldn't find the branch target for C2 command")
+    print("    Do you have a '#To be injected @ 8XXXXXXX' comment somewhere?")
+    exit(0)
+
 asm = read_file(argv[1])
 asm = fix_regs(asm)
 
