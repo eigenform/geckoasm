@@ -109,4 +109,4 @@ command = hexlify((0xC2000000 | (BRANCH_ADDR & 0x00ffffff)).to_bytes(4, byteorde
 num_lines = hexlify((len(instrs) // 2).to_bytes(4, byteorder='big'))
 output = [command, num_lines] + instrs
 for i in range(0, len(output), 2):
-    print((output[i] + b" " + output[i+1]).decode('utf8'))
+    print((output[i] + b" " + output[i+1]).decode('utf8').upper())

@@ -1,0 +1,262 @@
+#!/usr/bin/python
+""" geckoasm
+Use Keystone instead of GNU as. Seems to work okay, apart from the fact that
+we need to do a bunch of transformations on perfectly sane assembly in order
+to get Keystone to parse things correctly. Kinda sucks.
+"""
+
+import argparse
+import os
+import re
+
+from sys import argv
+#from keystone import *
+from binascii import hexlify, unhexlify
+
+def check_files(file_list):
+    """ Return True if all files in the given list are valid """
+    for fn in file_list:
+        if not (os.path.isfile(fn)):
+            print("[!] Couldn't find infile '{}'".format(fn))
+            return False
+    return True
+
+def get_metadata(filename):
+    """ Return the geckoasm metadata associated with the given file.
+    Expects comments (ideally in the header) of the form:
+
+        '# key: value'
+
+    Where some valid keys and options are:
+
+        - name: <string>
+        - author: <string>
+        - branch: <hex number>
+        - dol-stitch: [append|prepend]
+    """
+
+    res = {'author': None,
+            'name': None,
+            'branch': None,
+            'dol_stitch': None,
+            }
+    with open(filename, "r") as f:
+        for line in f:
+            m = re.search('(?:^# ?author: )(.*)', line)
+            if (m is not None):
+                res['author'] = m.group(1)
+
+            m = re.search('(?:^# ?name: )(.*)', line)
+            if (m is not None):
+                res['name'] = m.group(1)
+
+            m = re.search('(?:^# ?branch: )(0?x?[0-9a-fA-f]{8})', line)
+            if (m is not None):
+                res['branch'] = int(m.group(1), 16)
+
+            m = re.search('(?:^# ?dol-stitch: )([aA]ppend|[pP]repend)', line)
+            if (m is not None):
+                res['dol_stitch'] = m.group(1)
+    return res
+
+def fix_regs(data):
+    """ We have to parse up assembly somewhat in order to get Keystone
+    to play nicely, which sucks. This will probably break things. """
+    res = data
+    for reg in range(0, 31):
+        # Replace "rN" with "N"
+        res = res.replace("r"+str(reg), str(reg))
+        res = res.replace("(r"+str(reg)+")", "("+str(reg)+")")
+        res = res.replace(" r"+str(reg), " "+str(reg))
+        res = res.replace("\tr"+str(reg), "\t"+str(reg))
+        res = res.replace(",r"+str(reg), ","+str(reg))
+
+        # Replace "fN" with "N"
+        res = res.replace(" f"+str(reg), " "+str(reg))
+        res = res.replace("\tf"+str(reg), "\t"+str(reg))
+
+    #res = res.replace("sp", "1")
+    res = res.replace("(sp)", "(1)")
+    res = res.replace(" sp", " 1")
+    res = res.replace("\tsp", "\t1")
+    return res
+
+def get_target_branch(filename):
+    res = None
+    with open(filename, "r") as f:
+        for line in f:
+            # For the actual codehandler command
+            if ( ("#To be injected @" in line) or ("#To be inserted at" in line)):
+                s = line.split(" ")
+                res = int(s[4], 16)
+    return res
+
+def read_file(filename):
+    with open(filename, "r") as f:
+        code = f.read()
+    return code
+
+def assemble(text):
+    """ Given some set of assembly, use Keystone to assemble it into
+    a bytearray of 32-bit big-endian PPC instructions """
+    ks = Ks(KS_ARCH_PPC, KS_MODE_PPC32 + KS_MODE_BIG_ENDIAN)
+    encoding, count = ks.asm(text)
+    data = bytearray()
+    for instr in encoding:
+        data.append(instr)
+    return data
+
+def bin_to_gecko(data):
+    """ Given some bytearray of binary PPC instructions, turn them into
+    hex strings and pad accordingly for C2 codes """
+    sdata = hexlify(data)
+    instrs = [sdata[i:i+8] for i in range(0, len(sdata), 8)]
+    if ((len(instrs) % 2) == 0):
+        instrs += [b"60000000", b"00000000"]
+    else:
+        instrs.append(b"00000000")
+    return instrs
+
+def get_c2_command(branch_addr):
+    """ Given some hex int, return the appropriate C2 command """
+    cmd = (0xC2000000 | (branch_addr & 0x00ffffff)).to_bytes(4, byteorder='big')
+    return hexlify(cmd)
+
+def to_unixy_filename(x):
+    """ Convert some string to lowercase, spaces to dashes """
+
+def get_gecko_codes(filename):
+    """ Pull gecko codes out of the given file, returning a list """
+    gecko_codes = []
+    with open(filename, "r") as f:
+        for line in f:
+            m = re.search('^[0-9a-fA-F]{8} [0-9a-fA-f]{8}', line)
+            if (m is not None):
+                gecko_codes += m.group(0).split(" ")
+    return gecko_codes
+
+def gecko_to_binary(codelist):
+    """ Given some list of PPC instructions as hex strings,
+    return the corresponding bytearray with binary data """
+
+
+def disassemble(data):
+    """ Given some bytearray of binary PPC instructions, produce some
+    disassembly and return it """
+    md = Cs(CS_ARCH_PPC, CS_MODE_32 + CS_MODE_BIG_ENDIAN)
+
+
+""" ---------------------------------------------------------------------------
+Use argparse to deal with user input.
+"""
+
+desc = """
+Compiles sets of Gecko codes from one or more assembly files.
+Converts Gecko codes back into assembly (currently experimental).
+See project on GitHub for more information: https://github.com/hosaka-corp/geckoasm
+"""
+
+parser = argparse.ArgumentParser(description=desc)
+
+parser.add_argument('mode', help="'asm' OR 'disas'")
+parser.add_argument('infile', nargs='+',
+        help='assembly file[s] to-be-compiled')
+
+parser.add_argument('-w', '--write',
+        help="write output to files based on the code name",
+        action="store_true")
+
+args = parser.parse_args()
+print(args)
+
+if not (check_files(args.infile)):
+    exit(-1)
+
+metadata = []
+for fn in args.infile:
+    metadata.append(get_metadata(fn))
+print(metadata)
+
+
+if (args.mode == 'asm'):
+    try:
+        from keystone import *
+    except ModuleNotFoundError as e:
+        print("[!] It seems like you don't have Keystone installed.")
+        print("[!] You can't use the 'asm' mode without Keystone.")
+        print(e)
+        exit(0)
+
+    print("[*] Assembling files ...")
+    for idx in range(0, len(args.infile)):
+        print("============================================")
+        print("[*] Assembling {}".format(args.infile[idx]))
+        print("name: {}\nauthor: {}\nbranch: {}\n".format(
+                    metadata[idx]['name'],
+                    metadata[idx]['author'],
+                    hex(metadata[idx]['branch'])))
+        output_contents = "# name: {}\n# author: {}\n# branch: {}\n".format(
+                    metadata[idx]['name'],
+                    metadata[idx]['author'],
+                    hex(metadata[idx]['branch']))
+
+        branch_target = metadata[idx]['branch']
+
+        asm = read_file(args.infile[idx])
+        asm = fix_regs(asm)
+
+        data    = assemble(asm)
+        instrs  = bin_to_gecko(data)
+        command = get_c2_command(branch_target)
+
+        num_lines = hexlify((len(instrs) // 2).to_bytes(4, byteorder='big'))
+        output = [command, num_lines] + instrs
+
+        # Output
+        for i in range(0, len(output), 2):
+            output_contents += (output[i] + b" " + output[i+1]+b"\n").decode('utf8').upper()
+            print((output[i] + b" " + output[i+1]).decode('utf8').upper())
+
+        if (args.write is True):
+            filename = "/tmp/" + metadata[idx]['name'].lower()
+            filename = filename.replace(" ", "-")
+            filename += ".gecko"
+            with open(filename, "w") as f:
+                f.write(output_contents)
+                print("[*] Wrote to {}".format(filename))
+    exit(0)
+
+if (args.mode == 'disas'):
+    try:
+        from capstone import *
+    except ModuleNotFoundError as e:
+        print("[!] It seems like you don't have Capstone installed.")
+        print("[!] You can't use the 'disas' mode without Capstone.")
+        print(e)
+        exit(0)
+
+    print("[*] Disassembling files ...")
+    for idx in range(0, len(args.infile)):
+        print("============================================")
+        print("[*] Disassembling {}".format(args.infile[idx]))
+        print("name: {}\nauthor: {}\nbranch: {}\n".format(
+                    metadata[idx]['name'],
+                    metadata[idx]['author'],
+                    hex(metadata[idx]['branch'])))
+
+        gecko_codes = get_gecko_codes(args.infile[idx])
+
+        # Remove C2 code header and ending zeros
+        gecko_codes = gecko_codes[2:]
+        gecko_codes.pop()
+
+        # Convert to binary
+        data = bytearray()
+        for item in gecko_codes:
+            data += unhexlify(item)
+
+        # Produce some disassembly
+        md = Cs(CS_ARCH_PPC, CS_MODE_32 + CS_MODE_BIG_ENDIAN)
+        disasm = md.disasm(data, 0)
+        for instr in disasm:
+            print("0x{:08X}:\t{}\t{}".format(instr.address, instr.mnemonic, instr.op_str))
