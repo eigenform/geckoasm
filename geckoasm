@@ -1,8 +1,16 @@
 #!/usr/bin/python
 """ geckoasm
-Use Keystone instead of GNU as. Seems to work okay, apart from the fact that
-we need to do a bunch of transformations on perfectly sane assembly in order
-to get Keystone to parse things correctly. Kinda sucks.
+WIP tool for interconverting between PowerPC assembly and Gecko codesets,
+powered by Keystone and Capstone.
+
+NOTES
+=====
+* Keystone parses assembly somewhat differently than the GNU assembler.
+  Be careful making assumptions about how Keystone will handle input.
+
+* Disassembly is experimental. Recall that Capstone does not [*can not*]
+  necessarily make a perfect distinction between code and plain-ol' data.
+  Right now, it's up to the user to make this distinction.
 """
 
 import argparse
@@ -31,32 +39,46 @@ def get_metadata(filename):
 
         - name: <string>
         - author: <string>
-        - branch: <hex number>
+        - code: [c2|06]
+        - addr: <hex number>
         - dol-stitch: [append|prepend]
     """
 
     res = {'author': None,
             'name': None,
-            'branch': None,
+            'addr': None,
+            'code': None,
             'dol_stitch': None,
+            'repl': [],
             }
     with open(filename, "r") as f:
         for line in f:
-            m = re.search('(?:^# ?author: )(.*)', line)
+            m = re.search('(?:^# ?@author: )(.*)', line)
             if (m is not None):
                 res['author'] = m.group(1)
 
-            m = re.search('(?:^# ?name: )(.*)', line)
+            m = re.search('(?:^# ?@name: )(.*)', line)
             if (m is not None):
                 res['name'] = m.group(1)
 
-            m = re.search('(?:^# ?branch: )(0?x?[0-9a-fA-f]{8})', line)
+            m = re.search('(?:^# ?@code: )(0?x?[0-9a-fA-F]{2})', line)
             if (m is not None):
-                res['branch'] = int(m.group(1), 16)
+                res['code'] = int(m.group(1), 16)
 
-            m = re.search('(?:^# ?dol-stitch: )([aA]ppend|[pP]repend)', line)
+            m = re.search('(?:^# ?@addr: )(0?x?[0-9a-fA-f]{8})', line)
+            if (m is not None):
+                res['addr'] = int(m.group(1), 16)
+
+            m = re.search('(?:^# ?@dol-stitch: )([aA]ppend|[pP]repend)', line)
             if (m is not None):
                 res['dol_stitch'] = m.group(1)
+
+            m = re.search('(?:^# ?@([0-9a-fA-F]{8}): )(.*)', line)
+            if (m is not None):
+                entry = {'addr': None, 'asm': None}
+                entry['addr'] = int(m.group(1), 16)
+                entry['asm'] = m.group(2)
+                res['repl'].append(entry)
     return res
 
 def fix_regs(data):
@@ -96,11 +118,17 @@ def read_file(filename):
         code = f.read()
     return code
 
-def assemble(text):
+def asdf(symbol, value):
+    """ overload default symbol resolving function in assembler"""
+    print(symbol)
+    print(value)
+
+def assemble(text, addr):
     """ Given some set of assembly, use Keystone to assemble it into
     a bytearray of 32-bit big-endian PPC instructions """
     ks = Ks(KS_ARCH_PPC, KS_MODE_PPC32 + KS_MODE_BIG_ENDIAN)
-    encoding, count = ks.asm(text)
+    ks.sym_resolver = asdf
+    encoding, count = ks.asm(text, addr)
     data = bytearray()
     for instr in encoding:
         data.append(instr)
@@ -113,13 +141,26 @@ def bin_to_gecko(data):
     instrs = [sdata[i:i+8] for i in range(0, len(sdata), 8)]
     if ((len(instrs) % 2) == 0):
         instrs += [b"60000000", b"00000000"]
+        added_bytes = 8
     else:
         instrs.append(b"00000000")
-    return instrs
+        added_bytes = 4
+    return (instrs, added_bytes)
 
 def get_c2_command(branch_addr):
     """ Given some hex int, return the appropriate C2 command """
     cmd = (0xC2000000 | (branch_addr & 0x00ffffff)).to_bytes(4, byteorder='big')
+    return hexlify(cmd)
+
+def get_04_command(addr):
+    """ Given some hex int, return the appropriate C2 command """
+    cmd = (0x04000000 | (addr & 0x00ffffff)).to_bytes(4, byteorder='big')
+    return hexlify(cmd)
+
+
+def get_06_command(branch_addr):
+    """ Given some hex int, return the appropriate C2 command """
+    cmd = (0x06000000 | (branch_addr & 0x00ffffff)).to_bytes(4, byteorder='big')
     return hexlify(cmd)
 
 def to_unixy_filename(x):
@@ -129,8 +170,10 @@ def get_gecko_codes(filename):
     """ Pull gecko codes out of the given file, returning a list """
     gecko_codes = []
     with open(filename, "r") as f:
+        block = 0
+        # At the start of some C2 code
         for line in f:
-            m = re.search('^[0-9a-fA-F]{8} [0-9a-fA-f]{8}', line)
+            m = re.search('^[0-9a-fA-F]{8} [0-9a-fA-F]{8}', line)
             if (m is not None):
                 gecko_codes += m.group(0).split(" ")
     return gecko_codes
@@ -145,18 +188,92 @@ def disassemble(data):
     disassembly and return it """
     md = Cs(CS_ARCH_PPC, CS_MODE_32 + CS_MODE_BIG_ENDIAN)
 
+def assemble_repl(entry):
+    """ Given some dict {'asm' : <assembly string>, 'addr': <base addr> },
+    representing a 04 code, emit a single instruction in hex string format """
+
+    asm = entry['asm']
+    addr = entry['addr']
+
+    # Deal with injecting 'bl' instructions. Note that Keystone will transform
+    # the immediate into an absolute address. Note that this is *not* the way
+    # you expect GNU `as` to parse assembly. For instance, for PC=0x8016e74c,
+    # the string 'bl 0x32ed94' will emit a branching instruction to 0x8032ed94,
+    # *not* a branching instruction to (PC+0x32ed94).
+
+    instr = None
+    m = re.search('(bl).*(0?x?[0-9a-fA-F]{8})', asm)
+    if (m is not None):
+        bl_inst = m.group(1)
+        bl_addr = int(m.group(2),16)
+        if ((bl_addr > 0x80000000) and (bl_addr < 0x817fffff)):
+            bl_imm = bl_addr & 0x007fffff
+            bl_asm = "bl {}".format(hex(bl_imm))
+            instr = assemble(bl_asm, addr)
+            return hexlify(instr)
+        else:
+            print("[!] Branching to {} is invalid".format(hex(bl_addr)))
+            return None
+
+    # Deal with all other instructions (might have to add more particular
+    # cases in the future where you need to do extra parsing, or deal with
+    # invalid user input here)
+
+    instr = assemble(entry['asm'], entry['addr'])
+    return hexlify(instr)
+
+
+
 
 """ ---------------------------------------------------------------------------
 Use argparse to deal with user input.
 """
 
 desc = """
-Compiles sets of Gecko codes from one or more assembly files.
-Converts Gecko codes back into assembly (currently experimental).
-See project on GitHub for more information: https://github.com/hosaka-corp/geckoasm
+DESCRIPTION
+===========
+Compiles sets of Gecko codes from one or more assembly files. Also supports
+converting Gecko codes back into assembly (currently experimental). You will
+need Python bindings for Keystone/Capstone for this script to work, see:
+
+    https://www.keystone-engine.org/
+    https://www.capstone-engine.org/
+
+HEADER FORMAT
+=============
+In order to emit Gecko codes, geckoasm expects assembly files to start with a
+header including some metadata about the file.
+
+name    - The name of the code (optional)
+author  - The author's name (optional)
+addr    - Address (required)
+code    - The Gecko code type (required)
+            C2 - inject
+            06 - replace block
+
+For example:
+
+    # @name: Do a thing
+    # @author: meta
+    # @addr: 0x8005c4b8
+    # @code : c2
+    <assembly follows>
+    ...
+
+REPLACING AN INSTRUCTION
+========================
+In your assembly file, you can include comments with the following form:
+
+    # @8037b348: nop
+    # @8037b348: nop
+    # @8006184c: bl 0x8038fe44
+
+This will instruction geckoasm to assemble the instruction and produce an '04'
+code to patch the word at the given address.
 """
 
-parser = argparse.ArgumentParser(description=desc)
+from argparse import RawTextHelpFormatter
+parser = argparse.ArgumentParser(description=desc, formatter_class=RawTextHelpFormatter)
 
 parser.add_argument('mode', help="'asm' OR 'disas'")
 parser.add_argument('infile', nargs='+',
@@ -167,7 +284,6 @@ parser.add_argument('-w', '--write',
         action="store_true")
 
 args = parser.parse_args()
-print(args)
 
 if not (check_files(args.infile)):
     exit(-1)
@@ -175,7 +291,6 @@ if not (check_files(args.infile)):
 metadata = []
 for fn in args.infile:
     metadata.append(get_metadata(fn))
-print(metadata)
 
 
 if (args.mode == 'asm'):
@@ -191,39 +306,43 @@ if (args.mode == 'asm'):
     for idx in range(0, len(args.infile)):
         print("============================================")
         print("[*] Assembling {}".format(args.infile[idx]))
-        print("name: {}\nauthor: {}\nbranch: {}\n".format(
-                    metadata[idx]['name'],
-                    metadata[idx]['author'],
-                    hex(metadata[idx]['branch'])))
-        output_contents = "# name: {}\n# author: {}\n# branch: {}\n".format(
-                    metadata[idx]['name'],
-                    metadata[idx]['author'],
-                    hex(metadata[idx]['branch']))
+        #print("[*]   Codetype: {:02X}".format(metadata[idx]['code']))
+        #print("[*]    Address: {}".format(hex(metadata[idx]['addr'])))
 
-        branch_target = metadata[idx]['branch']
+
+        addr = metadata[idx]['addr']
 
         asm = read_file(args.infile[idx])
         asm = fix_regs(asm)
 
-        data    = assemble(asm)
-        instrs  = bin_to_gecko(data)
-        command = get_c2_command(branch_target)
+        data    = assemble(asm, addr)
+        instrs, padding = bin_to_gecko(data)
 
-        num_lines = hexlify((len(instrs) // 2).to_bytes(4, byteorder='big'))
-        output = [command, num_lines] + instrs
+        if (metadata[idx]['code'] == 0xc2):
+            command = get_c2_command(addr)
+            num_lines = hexlify((len(instrs) // 2).to_bytes(4, byteorder='big'))
+            output = [command, num_lines] + instrs
 
-        # Output
+        if (metadata[idx]['code'] == 0x06):
+            command = get_06_command(addr)
+            len_bytes = len(data) + padding
+            num_lines = hexlify(len_bytes.to_bytes(4, byteorder='big'))
+            output = [command, num_lines] + instrs
+
+        # Render any single word replacements (Gecko 0x04 commands)
+        repl = []
+        for entry in metadata[idx]['repl']:
+            repl_asm = entry['asm']
+            repl_addr = entry['addr']
+            repl_instr = assemble_repl(entry)
+            repl_command = get_04_command(entry['addr'])
+            print((repl_command + b" " + repl_instr).decode('utf8').upper())
+
+
+        # Main Output
         for i in range(0, len(output), 2):
-            output_contents += (output[i] + b" " + output[i+1]+b"\n").decode('utf8').upper()
             print((output[i] + b" " + output[i+1]).decode('utf8').upper())
 
-        if (args.write is True):
-            filename = "/tmp/" + metadata[idx]['name'].lower()
-            filename = filename.replace(" ", "-")
-            filename += ".gecko"
-            with open(filename, "w") as f:
-                f.write(output_contents)
-                print("[*] Wrote to {}".format(filename))
     exit(0)
 
 if (args.mode == 'disas'):
@@ -239,16 +358,17 @@ if (args.mode == 'disas'):
     for idx in range(0, len(args.infile)):
         print("============================================")
         print("[*] Disassembling {}".format(args.infile[idx]))
-        print("name: {}\nauthor: {}\nbranch: {}\n".format(
-                    metadata[idx]['name'],
-                    metadata[idx]['author'],
-                    hex(metadata[idx]['branch'])))
 
         gecko_codes = get_gecko_codes(args.infile[idx])
+        addr = metadata[idx]['addr']
 
         # Remove C2 code header and ending zeros
-        gecko_codes = gecko_codes[2:]
-        gecko_codes.pop()
+        if (metadata[idx]['code'] == 0xc2):
+            gecko_codes = gecko_codes[2:]
+            gecko_codes.pop()
+        if (metadata[idx]['code'] == 0x06):
+            gecko_codes = gecko_codes[2:]
+            gecko_codes.pop()
 
         # Convert to binary
         data = bytearray()
@@ -257,6 +377,8 @@ if (args.mode == 'disas'):
 
         # Produce some disassembly
         md = Cs(CS_ARCH_PPC, CS_MODE_32 + CS_MODE_BIG_ENDIAN)
-        disasm = md.disasm(data, 0)
+        disasm = md.disasm(data, addr)
         for instr in disasm:
-            print("0x{:08X}:\t{}\t{}".format(instr.address, instr.mnemonic, instr.op_str))
+            print("0x{:08X}:\t{}\t{}\t{}".format(instr.address,
+                hexlify(instr.bytes).decode('utf8'),
+                instr.mnemonic, instr.op_str))
